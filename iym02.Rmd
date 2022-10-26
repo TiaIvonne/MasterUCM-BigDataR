@@ -1,0 +1,570 @@
+---
+title: "Aplicaciones del Big Data en la Empresa 02"
+author: 
+    name: Ivonne Yañez Mendoza 
+    affiliation: Master Big Data & Business Analytics, Universidad Complutense de Madrid
+date: "Octubre 2022"
+output:
+  html_document:
+    df_print: paged
+    toc_depth: 3
+    number_sections: true 
+    theme: yeti
+    highlight: tango
+    code_folding: hide
+    fig_width: 9
+    fig_height: 7
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+lang: es-ES
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+Preparación del entorno de trabajo y carga de librerías
+
+```{r}
+# Library loading
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(caret)
+  library(scales)
+  library(ggplot2)
+  library(stringi)
+  library(stringr)
+  library(dataPreparation)
+  library(knitr)
+  library(kableExtra)
+  library(ggpubr)
+  library(tictoc)
+  library(ggeasy)
+  library(lubridate)
+  library(inspectdf)
+  library(ranger)
+  library(gbm)
+})
+
+```
+
+# Introducción al problema
+
+Utilizando los datos provistos por el Ministerio del agua de Tanzania,
+se requiere construir un modelo que sea capaz de predecir cuales bombas
+de agua están operativas, operativas pero que necesitan reparación o
+están dañadas, basadas en un set de datos train.
+
+En el primer modelo solo se realizaron pruebas con las variables
+numéricas, obteniendo un scoring aceptable pero mejorable.
+
+En este segundo modelo se realizaran combinaciones de variables y
+transformaciones buscando mejoras y optimizaciones.
+
+# Exploración inicial al conjunto de datos
+
+De forma original se incluye los dataset *train* y *test* mas el archivo
+con las *labels*.
+
+```{r exploracion, message=FALSE, warning=FALSE, layout="l-body"}
+# Data Loading
+#Fichero datos train
+vtrain <- fread("train_set.csv")
+vtrain$flag <- 1 # Columna que indica si es parte del set train (1) test (0)
+
+#Fichero datos test
+vtest <- fread("test_set.csv")
+vtest$flag <- 0 # Columna que indica si es parte del set train (1) test (0)
+
+#Fichero con labels o objetivo
+vlabels <-fread("labels.csv")
+
+# Se unen las labels con el set de datos train
+train <- merge(vlabels, vtrain)
+
+# Se unen ambos datasets (train y test) lo cual es lo recomendado para mas adelante trabajar en Feature engineering
+datos <- as.data.table(rbind(vtrain, vtest))
+
+#Comprobacion
+head(datos)
+head(vlabels)
+
+#Distribucion de los datos
+str(datos)
+```
+
+Se despliega la distribución de la variable objetivo (contenida en
+*labels)* Se observa algo de desbalance el cual no debería afectar
+demasiado.
+
+```{r balance}
+cuenta <- vlabels %>% count(status_group)
+porcentaje <- round( prop.table(table(vlabels$status_group))*100, 2)
+kable(cuenta, col.names = c('status_group', 'count'))
+kable(porcentaje, col.names = c('status_group', '%'))
+barplot(porcentaje, col=rgb(0.2,0.4,0.6,0.6))
+
+```
+
+# Exploratory data analysis EDA
+
+```{r eda}
+
+# categorical plot
+x <- inspect_cat(datos) 
+show_plot(x)
+
+# correlations in numeric columns
+x <- inspect_cor(datos)
+show_plot(x)
+
+# feature imbalance bar plot
+x <- inspect_imb(datos)
+show_plot(x)
+
+# memory usage barplot
+x <- inspect_mem(datos)
+show_plot(x)
+
+# missingness barplot
+x <- inspect_na(datos)
+show_plot(x)
+
+# histograms for numeric columns
+x <- inspect_num(datos)
+show_plot(x)
+
+# barplot of column types
+x <- inspect_types(datos)
+show_plot(x)
+```
+
+## Observaciones EDA
+
+1.  Una gran parte de las *features* son de tipo categóricas.
+
+2.  Se deben explorar los *missing values* (en gris) en el primer
+    gráfico de frecuencias de las categóricas.
+
+3.  wpt_name, subvillage, scheme_name e installer son las que ocupan mas
+    espacio en memoria, si se revisan en el gráfico de frecuencias de
+    las categóricas, son las que mas categorías contienen por cada una
+    de las variables.
+
+4.  public_meeting y permit muestran columnas con % de NA (5.6% y 5.1%
+    respectivamente)
+
+5.  La *feature* construction_year tiene valores en 0, es decir, no hay
+    información codificada del año de construcción de la bomba de agua.
+
+6.  También se deben explorar las demás variables numéricas con 0 para
+    determinar que hacer con ellas.
+
+# Feature engineering
+
+En el modelo anterior se trabajaron solo con variables numéricas, en
+este modelo se exploraran numéricas y categóricas.
+
+Se exploran algunas columnas como categóricas para construir el modelo:
+
+```{r remueve }
+# Remueve atributos que no se usaran
+datos$num_private <- NULL
+datos$amount_tsh <- NULL
+datos$wpt_name <- NULL
+datos$subvillage <- NULL
+datos$region_code <- NULL
+datos$lga <- NULL
+datos$ward <- NULL
+datos$recorded_by <- NULL
+datos$scheme_name <- NULL
+datos$permit <- NULL
+datos$extraction_type <- NULL
+datos$extraction_type_class <- NULL
+datos$management_group <- NULL
+datos$quality_group <- NULL
+datos$quantity_group <- NULL
+datos$waterpoint_type_group <- NULL
+datos$source_type <- NULL
+datos$date_recorded <- NULL
+datos$district_code <- NULL
+datos$payment_type <- NULL
+```
+
+Se inspecciona el nuevo dataset
+
+```{r}
+x <- inspect_types(datos)
+show_plot(x)
+
+```
+
+Revisión de valores NA o ceros
+
+```{r}
+x <- inspect_na(datos)
+show_plot(x)
+
+```
+
+En este caso public_meeting es una variable de tipo booleano que
+contiene un 5.6% de valores en NA.
+
+```{r}
+table(datos$public_meeting)
+```
+
+Se imputan los NA a la opción mayoritaria que es TRUE
+
+```{r imputa}
+datos$fe_public_meeting<- ifelse(is.na(datos$public_meeting), FALSE, datos$public_meeting)
+datos$fe_public_meeting_missing<-ifelse(is.na(datos$public_meeting), 1,0)
+
+# Eliminacion de variable original
+datos$public_meeting <- NULL
+
+```
+
+```{r feature}
+# Syntax
+temp <- datos %>% mutate_at(vars(-c(flag)), ~na_if(., 0))
+#
+x <- inspect_na(temp)
+show_plot(x)
+```
+
+Se convierten los na anteriores en ceros otra vez (para no tener
+problemas al construir el modelo con ranger.
+
+```{r recode}
+temp[is.na(temp)] <- 0
+head(temp)
+```
+
+Se construyen algunas variables nuevas que pueden ser útiles a la hora
+de modelar. Se agregan con una fe\_ para identificarlas.
+
+La variable *construction_year* tiene un % importante de valores
+missing. Se crea una columna nueva con valores missing imputados segun
+la media.
+
+```{r zero}
+temp$fe_construction_year<-round(ifelse(temp$construction_year==0, mean(temp$construction_year[temp$construction_year>0]),temp$construction_year), 0)
+```
+
+```{r nuevas_variables}
+#Combinacion de latitud y longitud
+temp$fe_lonlat  <- sqrt(temp$longitude^2 + temp$latitude^2)
+```
+
+Otra variable que calcula la antigüedad de la bomba basada en su fecha
+de construcción
+
+```{r year}
+year <- year(now())
+temp$fe_antiguedad <- (year - temp$fe_construction_year)
+```
+
+Se elimina la variable *construction_year*
+
+```{r eliminac}
+temp$construction_year <- NULL
+```
+
+Se estudian las categóricas, hay features con un numero alto de
+categorías
+
+```{r}
+# Categoricas
+categoricas <- names(temp[, which(sapply(temp, is.character)), with = FALSE])
+
+#-Frecuencias
+freq_inicial <- apply(temp[, ..categoricas], 2, function(x) length(unique(x)))
+freq_inicial
+
+```
+
+Para estos casos se decide utilizar la técnica de sustituir cada
+categoría según su frecuencia de aparición
+
+feature: funder
+
+```{r}
+cfunder<-unique(temp[ , .(.N), by = .(funder)][order(-N)])
+cfunder$perc<-cfunder$N/length(temp$funder)*100
+
+temp[ , fe_funder := .N , by = .(funder)]
+
+temp$funder <- NULL # elimina feature
+```
+
+feature: installer
+
+```{r, warning=FALSE}
+cinstaller<-unique(temp[ , .(.N), by = .(installer)][order(-N)])
+cinstaller$perc<-cinstaller$N/length(temp$installer)*100
+
+temp[ ,fe_installer := .N , by = .(installer)]
+
+temp$installer <- NULL # elimina feature
+```
+
+feature: basin
+
+```{r, warning=FALSE}
+cbasin<-unique(temp[ , .(.N), by = .(basin)][order(-N)])
+cbasin$perc<-cbasin$N/length(temp$basin)*100
+
+temp[ ,fe_basin := .N , by = .(basin)]
+
+temp$basin <- NULL # elimina feature
+
+```
+
+feature: region
+
+```{r, warning=FALSE}
+cregion<-unique(temp[ , .(.N), by = .(region)][order(-N)])
+cregion$perc<-cregion$N/length(temp$region)*100
+
+temp[ ,fe_region := .N , by = .(region)]
+
+temp$region <- NULL # elimina feature
+
+```
+
+feature: scheme_management
+
+```{r, warning=FALSE}
+cscheme<-unique(temp[ , .(.N), by = .(scheme_management)][order(-N)])
+cscheme$perc<-cscheme$N/length(temp$scheme_management)*100
+
+temp[ ,fe_scheme := .N , by = .(scheme_management)]
+
+temp$scheme_management <- NULL # elimina feature
+
+```
+
+feature: extraction_type_group
+
+```{r, warning=FALSE}
+cextraction<-unique(temp[ , .(.N), by = .(extraction_type_group)][order(-N)])
+cextraction$perc<-cextraction$N/length(temp$extraction_type_group)*100
+
+temp[ ,fe_extract := .N , by = .(extraction_type_group)]
+
+temp$extraction_type_group <- NULL # elimina feature
+
+```
+
+feature: management
+
+```{r, warning=FALSE}
+cmanagement<-unique(temp[ , .(.N), by = .(management)][order(-N)])
+cmanagement$perc<-cmanagement$N/length(temp$management)*100
+
+temp[ ,fe_management := .N , by = .(management)]
+
+temp$management <- NULL # elimina feature
+
+```
+
+feature: payment
+
+```{r, warning=FALSE}
+cpayment<-unique(temp[ , .(.N), by = .(payment)][order(-N)])
+cpayment$perc<-cpayment$N/length(temp$payment)*100
+
+temp[ ,fe_payment := .N , by = .(payment)]
+
+temp$payment <- NULL # elimina feature
+
+```
+
+feature: water_quality
+
+```{r, warning=FALSE}
+cwater<-unique(temp[ , .(.N), by = .(water_quality)][order(-N)])
+cwater$perc<-cwater$N/length(temp$cwater)*100
+
+temp[ ,fe_water_quality := .N , by = .(water_quality)]
+
+temp$water_quality <- NULL # elimina feature
+
+```
+
+feature: quantity
+
+```{r, warning=FALSE}
+cquantity<-unique(temp[ , .(.N), by = .(quantity)][order(-N)])
+cquantity$perc<-cquantity$N/length(temp$quantity)*100
+
+temp[ ,fe_quantity := .N , by = .(quantity)]
+
+temp$quantity <- NULL # elimina feature
+
+```
+
+feature: source
+
+```{r, warning=FALSE}
+csource<-unique(temp[ , .(.N), by = .(source)][order(-N)])
+csource$perc<-csource$N/length(temp$source)*100
+
+temp[ ,fe_source := .N , by = .(source)]
+
+temp$source <- NULL # elimina feature
+
+```
+
+feature: source_class
+
+```{r, warning=FALSE}
+csource_c<-unique(temp[ , .(.N), by = .(source_class)][order(-N)])
+csource_c$perc<-csource_c$N/length(temp$source_class)*100
+
+temp[ ,fe_source_class := .N , by = .(source_class)]
+
+temp$source_class <- NULL # elimina feature
+
+```
+
+feature: waterpoint_type
+
+```{r, warning=FALSE}
+cwaterpoint<-unique(temp[ , .(.N), by = .(waterpoint_type)][order(-N)])
+cwaterpoint$perc<-cwaterpoint$N/length(temp$waterpoint_type)*100
+
+temp[ ,fe_waterpoint_type := .N , by = .(waterpoint_type)]
+
+temp$waterpoint_type <- NULL # elimina feature
+
+```
+
+# Pasos previos a modelizar
+
+```{r}
+# Separa train y test segun su flag
+trainset<-temp[temp$flag==1,]
+
+#table(trainset$flag) comprobacion
+testset<-temp[temp$flag==0,]
+
+# Se combina el train set con la variable objetivo
+trainset <- merge(trainset, vlabels, by ='id', sort = FALSE)
+
+# Elimina la columna flag y la columna id
+trainset$flag <- NULL
+testset$flag <- NULL
+trainset$id <-NULL
+```
+
+La columna *status_group* indica en palabras si es funcional o no. Se
+recodifica para simplificar
+
+```{r muta}
+trainset = trainset %>%
+  mutate(status_group = ifelse(status_group== "functional", 0,
+                        ifelse(status_group == "functional needs repair",1 , 2)))
+table(trainset$status_group)
+```
+
+# Construccion de modelo
+
+## Random forest con ranger
+
+Tomando como base lo anterior y considerando las variables seleccionadas
+anteriormente se construye el segundo modelo.
+
+```{r ranger}
+fit <- ranger(status_group ~. ,
+               data = trainset,
+                num.trees = 300,
+                mtry=6,
+                importance = 'impurity',
+                write.forest = TRUE,
+                min.node.size = 1,
+                splitrule = "gini",
+                verbose = TRUE,
+                classification = TRUE,
+               seed=1234
+                )
+```
+
+Se despliegan los resultados
+
+```{r}
+print(fit)
+```
+
+Al contrario del primer modelo solo con variables numéricas, aquí el
+modelo2 presenta una mejoría considerable. Se mira la matriz de
+confusión para *trainset.*
+
+```{r}
+predictions_train <- predict(fit, data = trainset)
+confusionMatrix(table( trainset$status_group, predictions_train$predictions))
+
+```
+
+Se predice sobre los datos del concurso
+
+```{r}
+predictions_concurso <- predict(fit, data = testset)
+resultados_concurso<- as.data.frame(cbind( testset$id,predictions_concurso$predictions))
+names(resultados_concurso)<-c("id", "status_group")
+resultados_concurso$status_group<-ifelse(resultados_concurso$status_group==0,"functional",
+                               ifelse(resultados_concurso$status_group==1,"functional needs repair","non functional"))
+
+#Se guarda en el fichero que se subirá a la plataforma -->
+fwrite(resultados_concurso, file = "results_model2.csv")
+```
+
+Variables importantes
+
+```{r}
+vars_imp <- fit$variable.importance
+vars_imp <- as.data.frame(vars_imp)
+vars_imp$myvar <- rownames(vars_imp)
+vars_imp <- as.data.table(vars_imp)
+setorder(vars_imp, -vars_imp)
+```
+
+Plot de variables mas importantes
+
+```{r}
+ggbarplot(vars_imp,
+          x = "myvar", y = "vars_imp",
+          #fill  = 'myvar',
+          color = "blue",
+          palette = "jco",
+          sort.val = "asc",
+          sort.by.groups = FALSE,
+          x.text.angle = 90,
+          ylab = "Importancia",
+          xlab = 'Variable',
+          #legend.title = "MPG Group",
+          rotate = TRUE,
+          ggtheme = theme_minimal()
+          )
+```
+
+# Conclusiones
+
+1.  Las *features* con mas peso predictivo para este modelo son la
+    recategorizacion fe_quantity (cuanta cantidad de agua tiene la
+    bomba) seguida de latitud, fe_lonlat, longitud (mismas que aparecen
+    liderando el peso predictivo en el modelo1) ademas de
+    fe_waterpoint_type. Es decir las recategorizaciones de categoricas
+    segun frecuencias, se vieron reflejadas en este modelo.
+
+2.  Este segundo modelo tiene un scoring de 0.8172 lo cual es una mejora
+    significativa para esta nueva predicción con respecto al modelo
+    básico anterior. Se creará un tercer modelo buscando si se puede
+    obtener alguna mejora adicional.
+
+    ![](images/Screenshot%202022-10-13%20at%2011.15.56.png)

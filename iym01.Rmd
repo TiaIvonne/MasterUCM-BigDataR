@@ -1,0 +1,312 @@
+---
+title: "Aplicaciones del Big Data en la Empresa"
+author: 
+    name: Ivonne Yañez Mendoza 
+    affiliation: Master Big Data & Business Analytics, Universidad Complutense de Madrid
+date: "Octubre 2022"
+output:
+  html_document:
+    df_print: paged
+    toc_depth: 3
+    number_sections: true 
+    theme: yeti
+    highlight: tango
+    code_folding: hide
+    fig_width: 9
+    fig_height: 7
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+lang: es-ES
+---
+
+Preparación del entorno de trabajo y carga de librerías
+
+```{r}
+# Limpieza 
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(caret)
+  library(scales)
+  library(ggplot2)
+  library(stringi)
+  library(stringr)
+  library(dataPreparation)
+  library(knitr)
+  library(kableExtra)
+  library(ggpubr)
+  library(tictoc)
+  library(ggeasy)
+  library(lubridate)
+  library(inspectdf)
+  library(ranger)
+  library(gbm)
+})
+
+```
+
+# Introducción al problema
+
+Utilizando los datos provistos por el Ministerio del agua de Tanzania, se requiere construir un modelo que sea capaz de predecir cuales bombas de agua están operativas, operativas pero que necesitan reparación o están dañadas, basadas en un set de datos *train*.
+
+# Exploración inicial al conjunto de datos
+
+De forma original se incluye los dataset *train* y *test* mas el archivo con las *labels*.
+
+```{r exploracion, message=FALSE, warning=FALSE, layout="l-body"}
+# Data Loading
+#Fichero datos train
+vtrain <- fread("train_set.csv")
+vtrain$flag <- 1 # Columna que indica si es parte del set train (1) o test (0)
+
+#Fichero datos test
+vtest <- fread("test_set.csv")
+vtest$flag <- 0 # Columna que indica si es parte del set train (1) o test (0)
+
+#Fichero con labels o objetivo
+vlabels <-fread("labels.csv")
+
+# Se unen las labels con el set de datos train
+train <- merge(vlabels, vtrain)
+
+# Se unen ambos datasets (train y test) lo cual es lo recomendado para mas adelante trabajar en Feature engineering
+datos <- as.data.table(rbind(vtrain, vtest))
+
+#Comprobacion
+head(datos)
+head(vlabels)
+
+#Distribucion de los datos
+str(datos)
+```
+
+Se despliega la distribución de la variable objetivo (contenida en *labels)* Se observa algo de desbalance el cual no debería afectar demasiado
+
+```{r balance}
+cuenta <- vlabels %>% count(status_group)
+porcentaje <- round( prop.table(table(vlabels$status_group))*100, 2)
+kable(cuenta, col.names = c('status_group', 'count'))
+kable(porcentaje, col.names = c('status_group', '%'))
+barplot(porcentaje, col=rgb(0.2,0.4,0.6,0.6))
+
+```
+
+# Exploratory data analysis EDA
+
+```{r eda}
+
+# categorical plot
+x <- inspect_cat(datos) 
+show_plot(x)
+
+# correlations in numeric columns
+x <- inspect_cor(datos)
+show_plot(x)
+
+# feature imbalance bar plot
+x <- inspect_imb(datos)
+show_plot(x)
+
+# memory usage barplot
+x <- inspect_mem(datos)
+show_plot(x)
+
+# missingness barplot
+x <- inspect_na(datos)
+show_plot(x)
+
+# histograms for numeric columns
+x <- inspect_num(datos)
+show_plot(x)
+
+# barplot of column types
+x <- inspect_types(datos)
+show_plot(x)
+```
+
+## Observaciones EDA
+
+1.  Una gran parte de las *features* son de tipo categóricas
+
+2.  Se deben explorar los *missing values* (en gris) en el primer gráfico de frecuencias de las categóricas.
+
+3.  wpt_name, subvillage, scheme_name e installer son las que ocupan mas espacio en memoria, si se revisan en el gráfico de frecuencias de las categóricas, son las que mas categorías contienen por cada una de las variables.
+
+4.  public_meeting y permit muestran columnas con % de NA (5.6% y 5.1% respectivamente)
+
+5.  La *feature* construction_year tiene valores en 0, es decir, no hay información codificada del año de construcción de la bomba de agua.
+
+# Feature engineering
+
+Se construye un dataset sencillo para comenzar, que contiene solo variables numéricas. A medida que se avanza en el conocimiento del set de datos se irá agregando complejidad.
+
+```{r numericos}
+datos_num <- Filter(is.numeric, datos)
+head(datos_num)
+```
+
+Observando las variables numéricas hay algunas que pueden resultar interesantes y otras que deberían ser descartadas del estudio.
+
+Para comprobar lo anterior, en primer lugar se estudiara la presencia de valores en 0 que probablemente correspondan a valores NA.
+
+```{r feature}
+
+# Syntax
+temp <- datos_num %>% mutate_at(vars(-c(flag)), ~na_if(., 0))
+
+x <- inspect_na(temp)
+show_plot(x)
+```
+
+Basado en lo anterior y dado el alto num de NA las variables *num_private* y *amount_tsh* saldrán del modelo.
+
+```{r elimina}
+temp <- temp %>% select(-num_private, -amount_tsh)
+```
+
+Se convierten los na anteriores en ceros otra vez.
+
+```{r recode}
+temp[is.na(temp)] <- 0
+head(temp)
+```
+
+Se construyen algunas variables nuevas que pueden ser útiles a la hora de modelar. Se agregan con una fe\_ para identificarlas.
+
+La variable *construction_year* tiene un % importante de valores missing. Se crea una columna nueva con valores missing imputados segun la media.
+
+```{r zero}
+temp$fe_construction_year<-round(ifelse(temp$construction_year==0, mean(temp$construction_year[temp$construction_year>0]),temp$construction_year), 0)
+```
+
+```{r nuevas_variables}
+#Combinacion de latitud y longitud 
+temp$fe_lonlat  <- sqrt(temp$longitude^2 + temp$latitude^2)
+```
+
+Otra variable que calcula la antigüedad de la bomba basada en su fecha de construcción
+
+```{r year}
+year <- year(now())
+temp$fe_antiguedad <- (year - temp$fe_construction_year)
+```
+
+Se elimina la variable *construction_year*
+
+```{r eliminac}
+temp$construction_year <- NULL
+```
+
+# Pasos previos a modelizar
+
+```{r}
+# Separa train y test segun su flag
+trainset<-temp[temp$flag==1,]
+
+#table(trainset$flag) comprobacion
+testset<-temp[temp$flag==0,]
+
+# Se combina el train set con la variable objetivo
+trainset <- merge(trainset, vlabels, by ='id', sort = FALSE)
+
+# Elimina la columna flag y la columna id
+trainset$flag <- NULL
+testset$flag <- NULL
+trainset$id <-NULL
+```
+
+La columna *status_group* indica en palabras si es funcional o no. Se modifica para hacer mas simple la lectura
+
+```{r muta}
+trainset = trainset %>%
+  mutate(status_group = ifelse(status_group== "functional", 0, 
+                        ifelse(status_group == "functional needs repair",1 , 2)))
+table(trainset$status_group)
+```
+
+# Construccion de modelo
+
+## Random forest con ranger
+
+Tomando como base lo anterior y solo considerando variables numéricas se construye el primer modelo
+
+```{r ranger}
+fit <- ranger(status_group ~. ,
+               data = trainset,
+                num.trees = 300,
+                mtry=6,
+                importance = 'impurity',
+                write.forest = TRUE,
+                min.node.size = 1,
+                splitrule = "gini",
+                verbose = TRUE,
+                classification = TRUE,
+               seed=1234
+                )
+```
+
+Se despliegan los resultados
+
+```{r}
+print(fit)
+```
+
+Se crea la matriz de confusión para *trainset*
+
+```{r}
+predictions_train <- predict(fit, data = trainset)
+confusionMatrix(table( trainset$status_group, predictions_train$predictions))
+```
+
+Se predice sobre los datos del concurso
+
+```{r}
+predictions_concurso <- predict(fit, data = testset)
+resultados_concurso<- as.data.frame(cbind( testset$id,predictions_concurso$predictions))
+names(resultados_concurso)<-c("id", "status_group")
+resultados_concurso$status_group<-ifelse(resultados_concurso$status_group==0,"functional", ifelse(resultados_concurso$status_group==1,"functional needs repair","non functional"))
+
+# Crea archivo para subir a DataDriven
+fwrite(resultados_concurso, file = "results_model1.csv")
+```
+
+Variables importantes
+
+```{r}
+vars_imp <- fit$variable.importance 
+vars_imp <- as.data.frame(vars_imp) 
+vars_imp$myvar <- rownames(vars_imp)
+vars_imp <- as.data.table(vars_imp)
+setorder(vars_imp, -vars_imp)
+```
+
+Plot de variables más importantes
+
+```{r}
+ggbarplot(vars_imp,
+          x = "myvar", y = "vars_imp",
+          #fill  = 'myvar',
+          color = "blue",         
+          palette = "jco",            
+          sort.val = "asc",          
+          sort.by.groups = FALSE,    
+          x.text.angle = 90,      
+          ylab = "Importancia",
+          xlab = 'Variable', 
+          #legend.title = "MPG Group",
+          rotate = TRUE,
+          ggtheme = theme_minimal()
+          )
+```
+
+# Conclusiones:
+
+1.  Las *features* con mas peso predictivo para este modelo son latitud, la transformación de longitud y latitud, longitud y gps_height
+
+2.  Este primer modelo tiene un scoring de 0.7136 lo cual no es el más optimo pero para ser un modelo de tipo básico (como punto de partida y solo con datos numéricos) está aceptable. El próximo modelo incluirá variables numéricas como categóricas y algunas transformaciones para esas variables, buscando mejorar el scoring.
+
+    ![](images/Screenshot%202022-10-13%20at%2011.33.16.png)

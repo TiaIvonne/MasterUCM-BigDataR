@@ -1,0 +1,699 @@
+---
+title: "Aplicaciones del Big Data en la Empresa 03"
+author: 
+    name: Ivonne Yañez Mendoza 
+    affiliation: Master Big Data & Business Analytics, Universidad Complutense de Madrid
+date: "Octubre 2022"
+output:
+  html_document:
+    df_print: paged
+    toc_depth: 3
+    number_sections: true 
+    theme: yeti
+    highlight: tango
+    code_folding: hide
+    fig_width: 9
+    fig_height: 7
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+lang: es-ES
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+Preparación del entorno de trabajo y carga de librerías
+
+```{r}
+# Library loading
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(caret)
+  library(scales)
+  library(ggplot2)
+  library(stringi)
+  library(stringr)
+  library(dataPreparation)
+  library(knitr)
+  library(kableExtra)
+  library(ggpubr)
+  library(tictoc)
+  library(ggeasy)
+  library(lubridate)
+  library(inspectdf)
+  library(ranger)
+  library(gbm)
+  library(MLmetrics)
+})
+
+```
+
+# Introducción al problema
+
+Utilizando los datos provistos por el Ministerio del agua de Tanzania,
+se requiere construir un modelo que sea capaz de predecir cuales bombas
+de agua están operativas, operativas pero que necesitan reparación o
+están dañadas, basadas en un set de datos train.
+
+En el primer modelo solo se realizaron pruebas con las variables
+numéricas, obteniendo un scoring aceptable pero mejorable. En el segundo
+modelo se consiguío una mejora sustantiva y ahora en este tercer modelo
+se verá si se puede optimizar un poco más.
+
+# Exploracion inicial al conjunto de datos
+
+De forma original se incluye los dataset train y test mas el archivo con
+las labels.
+
+```{r exploracion, message=FALSE, warning=FALSE, layout="l-body"}
+# Data Loading
+#Fichero datos train
+vtrain <- fread("train_set.csv")
+vtrain$flag <- 1 # Columna que indica si es parte del set train (1) test (0)
+
+#Fichero datos test
+vtest <- fread("test_set.csv")
+vtest$flag <- 0 # Columna que indica si es parte del set train (1) test (0)
+
+#Fichero con labels o objetivo
+vlabels <-fread("labels.csv")
+
+# Se unen las labels con el set de datos train
+
+train <- merge(vlabels, vtrain)
+
+# Se unen ambos datasets (train y test) lo cual es lo recomendado para mas adelante trabajar en Feature engineering
+datos <- as.data.table(rbind(vtrain, vtest))
+#Comprobación
+head(datos)
+head(vlabels)
+
+#Distribución de los datos
+str(datos)
+```
+
+Distribución de la variable objetivo (balanceo) Se observa un poco de
+desbalance el cual no debería afectar demasiado
+
+```{r balance}
+cuenta <- vlabels %>% count(status_group)
+porcentaje <- round( prop.table(table(vlabels$status_group))*100, 2)
+kable(cuenta, col.names = c('status_group', 'count'))
+kable(porcentaje, col.names = c('status_group', '%'))
+barplot(porcentaje, col=rgb(0.2,0.4,0.6,0.6))
+
+```
+
+# Exploratory data analysis EDA
+
+```{r eda}
+
+# categorical plot
+x <- inspect_cat(datos) 
+show_plot(x)
+
+# correlations in numeric columns
+x <- inspect_cor(datos)
+show_plot(x)
+
+# feature imbalance bar plot
+x <- inspect_imb(datos)
+show_plot(x)
+
+# memory usage barplot
+x <- inspect_mem(datos)
+show_plot(x)
+
+# missingness barplot
+x <- inspect_na(datos)
+show_plot(x)
+
+# histograms for numeric columns
+x <- inspect_num(datos)
+show_plot(x)
+
+# barplot of column types
+x <- inspect_types(datos)
+show_plot(x)
+```
+
+## Observaciones EDA
+
+1.  Una gran parte de las *features* son de tipo categoricas
+
+2.  Se deben explorar los *missing values* (en gris) en el primer
+    gráfico de frecuencias de las categóricas.
+
+3.  wpt_name, subvillage, scheme_name e installer son las que ocupan mas
+    espacio en memoria, si se revisan en el gráfico de frecuencias de
+    las categóricas, son las que mas categorias contienen por cada una
+    de las variables.
+
+4.  public_meeting y permit muestran columnas con % de NA (5.6% y 5.1%
+    respectivamente)
+
+5.  La *feature* construction_year tiene valores en 0, es decir, no hay
+    información codificada del año de construcción de la bomba de agua.
+
+6.  Tambien se deben explorar las demas variables numéricas con 0 para
+    determinar que hacer con ellas.
+
+# Feature engineering
+
+Aqui se exploraran features numéricas y categóricas.
+
+Se exploran algunas columnas como categoricas para construir el modelo:
+
+No se incluyen todas las variables pues aunque podrían mejorar el modelo
+sería de un costo computacional alto y ademas varias contienen
+información muy similar entre unas y otras.
+
+```{r remueve }
+# Remueve atributos que no se usaran
+names(datos)
+
+#Quita las numericas que no han tenido gran incidencia en modelos anteriores
+datos$amount_tsh <- NULL
+datos$num_private <- NULL
+datos$region_code <- NULL
+datos$district_code <-NULL
+
+#Quita algunas adicionales 
+datos$date_recorded <- NULL
+datos$recorded_by <- NULL
+datos$permit <- NULL
+datos$public_meeting <-NULL
+datos$extraction_type_class <-NULL
+datos$waterpoint_type_group <- NULL
+
+```
+
+Se inspecciona el nuevo dataset
+
+```{r}
+x <- inspect_types(datos)
+show_plot(x)
+
+```
+
+Revision de valores NA o ceros
+
+NA,
+
+```{r}
+x <- inspect_na(datos)
+show_plot(x)
+
+```
+
+```{r feature}
+# Syntax
+temp <- datos %>% mutate_at(vars(-c(flag)), ~na_if(., 0))
+#
+x <- inspect_na(temp)
+show_plot(x)
+```
+
+Se convierten los na anteriores en ceros otra vez.
+
+```{r recode}
+temp[is.na(temp)] <- 0
+head(temp)
+```
+
+Se construyen algunas variables nuevas que pueden ser útiles a la hora
+de modelar. Se agregan con una fe\_ para identificarlas.
+
+La variable *construction_year* tiene un % importante de valores
+missing. Se crea una columna nueva con valores missing imputados segun
+la media.
+
+```{r zero}
+temp$fe_construction_year<-round(ifelse(temp$construction_year==0, mean(temp$construction_year[temp$construction_year>0]),temp$construction_year), 0)
+```
+
+```{r nuevas_variables}
+#Combinacion de latitud y longitud
+temp$fe_lonlat  <- sqrt(temp$longitude^2 + temp$latitude^2)
+```
+
+Otra variable que calcula la antigüedad de la bomba basada en su fecha
+de construcción
+
+```{r year}
+year <- year(now())
+temp$fe_antiguedad <- (year - temp$fe_construction_year)
+```
+
+Se elimina la variable *construction_year*
+
+```{r eliminac}
+temp$construction_year <- NULL
+```
+
+La *feature* population tiene un % relevante de valores en 0
+
+```{r population}
+temp$fe_population<-round(ifelse(temp$population==0, mean(temp$population[temp$population>0]),temp$population), 0)
+
+```
+
+Se elimina la variable *population*
+
+```{r, warning=FALSE}
+temp$population <- NULL
+```
+
+Se estudian las categóricas, hay features con un numero alto de
+categorías
+
+```{r}
+# Categoricas
+categoricas <- names(temp[, which(sapply(temp, is.character)), with = FALSE])
+
+#-Frecuencias
+freq_inicial <- apply(temp[, ..categoricas], 2, function(x) length(unique(x)))
+freq_inicial
+
+```
+
+Para estos casos se decide utilizar la técnica de sustituir cada
+categoría según su frecuencia de aparición
+
+feature: funder
+
+```{r}
+cfunder<-unique(temp[ , .(.N), by = .(funder)][order(-N)])
+cfunder$perc<-cfunder$N/length(temp$funder)*100
+
+temp[ , fe_funder := .N , by = .(funder)]
+
+temp$funder <- NULL # elimina feature
+```
+
+feature: installer
+
+```{r, warning=FALSE}
+cinstaller<-unique(temp[ , .(.N), by = .(installer)][order(-N)])
+cinstaller$perc<-cinstaller$N/length(temp$installer)*100
+
+temp[ ,fe_installer := .N , by = .(installer)]
+
+temp$installer <- NULL # elimina feature
+```
+
+feature: wpt_name
+
+```{r, warning=FALSE}
+cwpt<-unique(temp[ , .(.N), by = .(wpt_name)][order(-N)])
+cwpt$perc<-cwpt$N/length(temp$wpt_name)*100
+
+temp[ ,fe_wpt_name := .N , by = .(wpt_name)]
+
+temp$wpt_name <- NULL # elimina feature
+```
+
+feature: basin
+
+```{r, warning=FALSE}
+cbasin<-unique(temp[ , .(.N), by = .(basin)][order(-N)])
+cbasin$perc<-cbasin$N/length(temp$basin)*100
+
+temp[ ,fe_basin := .N , by = .(basin)]
+
+temp$basin <- NULL # elimina feature
+
+```
+
+feature: subvillage
+
+```{r, warning=FALSE}
+csubvillage<-unique(temp[ , .(.N), by = .(subvillage)][order(-N)])
+csubvillage$perc<-csubvillage$N/length(temp$subvillage)*100
+
+temp[ ,fe_subvillage := .N , by = .(subvillage)]
+
+temp$subvillage <- NULL # elimina feature
+
+```
+
+feature: region
+
+```{r, warning=FALSE}
+cregion<-unique(temp[ , .(.N), by = .(region)][order(-N)])
+cregion$perc<-cregion$N/length(temp$region)*100
+
+temp[ ,fe_region := .N , by = .(region)]
+
+temp$region <- NULL # elimina feature
+
+```
+
+feature: lga
+
+```{r, warning=FALSE}
+clga<-unique(temp[ , .(.N), by = .(lga)][order(-N)])
+clga$perc<-clga$N/length(temp$lga)*100
+
+temp[ ,fe_lga := .N , by = .(lga)]
+
+temp$lga <- NULL # elimina feature
+
+```
+
+feature: ward
+
+```{r, warning=FALSE}
+cward<-unique(temp[ , .(.N), by = .(ward)][order(-N)])
+cward$perc<-cward$N/length(temp$ward)*100
+
+temp[ ,fe_ward := .N , by = .(ward)]
+
+temp$ward<- NULL # elimina feature
+
+```
+
+feature: scheme_management
+
+```{r, warning=FALSE}
+cscheme<-unique(temp[ , .(.N), by = .(scheme_management)][order(-N)])
+cscheme$perc<-cscheme$N/length(temp$scheme_management)*100
+
+temp[ ,fe_scheme := .N , by = .(scheme_management)]
+
+temp$scheme_management <- NULL # elimina feature
+
+```
+
+feature: scheme_name
+
+```{r, warning=FALSE}
+cscheme_name<-unique(temp[ , .(.N), by = .(scheme_name)][order(-N)])
+cscheme_name$perc<-cscheme_name$N/length(temp$scheme_name)*100
+
+temp[ ,fe_scheme_name := .N , by = .(scheme_name)]
+
+temp$scheme_name <- NULL # elimina feature
+
+```
+
+feature: extraction_type
+
+```{r, warning=FALSE}
+cextraction_type<-unique(temp[ , .(.N), by = .(extraction_type)][order(-N)])
+cextraction_type$perc<-cextraction_type$N/length(temp$extraction_type)*100
+
+temp[ ,fe_extract_type := .N , by = .(extraction_type)]
+
+temp$extraction_type <- NULL # elimina feature
+
+```
+
+feature: extraction_type_group
+
+```{r, warning=FALSE}
+cextraction<-unique(temp[ , .(.N), by = .(extraction_type_group)][order(-N)])
+cextraction$perc<-cextraction$N/length(temp$extraction_type_group)*100
+
+temp[ ,fe_extract := .N , by = .(extraction_type_group)]
+
+temp$extraction_type_group <- NULL # elimina feature
+
+```
+
+feature: management
+
+```{r, warning=FALSE}
+cmanagement<-unique(temp[ , .(.N), by = .(management)][order(-N)])
+cmanagement$perc<-cmanagement$N/length(temp$management)*100
+
+temp[ ,fe_management := .N , by = .(management)]
+
+temp$management <- NULL # elimina feature
+
+```
+
+feature: management_group
+
+```{r, warning=FALSE}
+cmanagementg<-unique(temp[ , .(.N), by = .(management_group)][order(-N)])
+cmanagementg$perc<-cmanagementg$N/length(temp$management_group)*100
+
+temp[ ,fe_management_g := .N , by = .(management_group)]
+
+temp$management_group <- NULL # elimina feature
+
+```
+
+feature: payment
+
+```{r, warning=FALSE}
+cpayment<-unique(temp[ , .(.N), by = .(payment)][order(-N)])
+cpayment$perc<-cpayment$N/length(temp$payment)*100
+
+temp[ ,fe_payment := .N , by = .(payment)]
+
+temp$payment <- NULL # elimina feature
+
+```
+
+feature: payment_type
+
+```{r, warning=FALSE}
+cpayment_t<-unique(temp[ , .(.N), by = .(payment_type)][order(-N)])
+cpayment_t$perc<-cpayment$N/length(temp$payment_type)*100
+
+temp[ ,fe_payment := .N , by = .(payment_type)]
+
+temp$payment_type <- NULL # elimina feature
+
+```
+
+feature: water_quality
+
+```{r, warning=FALSE}
+cwater<-unique(temp[ , .(.N), by = .(water_quality)][order(-N)])
+cwater$perc<-cwater$N/length(temp$cwater)*100
+
+temp[ ,fe_water_quality := .N , by = .(water_quality)]
+
+temp$water_quality <- NULL # elimina feature
+
+```
+
+feature: quality_group
+
+```{r, warning=FALSE}
+cquality_group<-unique(temp[ , .(.N), by = .(quality_group)][order(-N)])
+cquality_group$perc<-cquality_group$N/length(temp$quality_group)*100
+
+temp[ ,fe_quality_group := .N , by = .(quality_group)]
+
+temp$quality_group <- NULL # elimina feature
+
+```
+
+feature: quantity
+
+```{r, warning=FALSE}
+cquantity<-unique(temp[ , .(.N), by = .(quantity)][order(-N)])
+cquantity$perc<-cquantity$N/length(temp$quantity)*100
+
+temp[ ,fe_quantity := .N , by = .(quantity)]
+
+temp$quantity <- NULL # elimina feature
+
+```
+
+feature: quantity_group
+
+```{r, warning=FALSE}
+cquantity_g<-unique(temp[ , .(.N), by = .(quantity_group)][order(-N)])
+cquantity_g$perc<-cquantity_g$N/length(temp$quantity_group)*100
+
+temp[ ,fe_quantity_group := .N , by = .(quantity_group)]
+
+temp$quantity_group <- NULL # elimina feature
+
+```
+
+feature: source
+
+```{r, warning=FALSE}
+csource<-unique(temp[ , .(.N), by = .(source)][order(-N)])
+csource$perc<-csource$N/length(temp$source)*100
+
+temp[ ,fe_source := .N , by = .(source)]
+
+temp$source <- NULL # elimina feature
+
+```
+
+feature: source_type
+
+```{r, warning=FALSE}
+csource_ct<-unique(temp[ , .(.N), by = .(source_type)][order(-N)])
+csource_ct$perc<-csource_ct$N/length(temp$source_type)*100
+
+temp[ ,fe_source_type := .N , by = .(source_type)]
+
+temp$source_type <- NULL # elimina feature
+
+```
+
+feature: source_class
+
+```{r, warning=FALSE}
+csource_c<-unique(temp[ , .(.N), by = .(source_class)][order(-N)])
+csource_c$perc<-csource_c$N/length(temp$source_class)*100
+
+temp[ ,fe_source_class := .N , by = .(source_class)]
+
+temp$source_class <- NULL # elimina feature
+
+```
+
+feature: waterpoint_type
+
+```{r, warning=FALSE}
+cwaterpoint<-unique(temp[ , .(.N), by = .(waterpoint_type)][order(-N)])
+cwaterpoint$perc<-cwaterpoint$N/length(temp$waterpoint_type)*100
+
+temp[ ,fe_waterpoint_type := .N , by = .(waterpoint_type)]
+
+temp$waterpoint_type <- NULL # elimina feature
+
+```
+
+# Pasos previos a modelizar
+
+```{r}
+# Separa train y test segun su flag
+trainset<-temp[temp$flag==1,]
+
+#table(trainset$flag) comprobacion
+testset<-temp[temp$flag==0,]
+
+# Se combina el train set con la variable objetivo
+trainset <- merge(trainset, vlabels, by ='id', sort = FALSE)
+
+# Elimina la columna flag y la columna id
+trainset$flag <- NULL
+testset$flag <- NULL
+trainset$id <-NULL
+```
+
+La columna *status_group* indica en palabras si es funcional o no. Se
+recodifica para simplificar
+
+```{r muta}
+trainset = trainset %>%
+  mutate(status_group = ifelse(status_group== "functional", 0,
+                        ifelse(status_group == "functional needs repair",1 , 2)))
+table(trainset$status_group)
+```
+
+# Construccion de modelo
+
+## Random forest con ranger
+
+Tomando como base lo anterior y considerando las variables seleccionadas
+anteriormente se construye el tercer modelo
+
+```{r ranger}
+fit <- ranger(status_group ~. ,
+               data = trainset,
+                num.trees = 300,
+                mtry=6,
+                importance = 'impurity',
+                write.forest = TRUE,
+                min.node.size = 1,
+                splitrule = "gini",
+                verbose = TRUE,
+                classification = TRUE,
+               seed=1234
+                )
+```
+
+Se despliegan los resultados
+
+```{r}
+
+print(fit)
+```
+
+El modelo3 presenta una pequena mejora con respecto al 2
+
+
+```{r}
+predictions_train <- predict(fit, data = trainset)
+confusionMatrix(table( trainset$status_group, predictions_train$predictions))
+
+```
+
+Se predice sobre los datos del concurso
+
+```{r}
+predictions_concurso <- predict(fit, data = testset)
+resultados_concurso<- as.data.frame(cbind( testset$id,predictions_concurso$predictions))
+names(resultados_concurso)<-c("id", "status_group")
+resultados_concurso$status_group<-ifelse(resultados_concurso$status_group==0,"functional",
+                               ifelse(resultados_concurso$status_group==1,"functional needs repair","non functional"))
+
+#Se guarda en el fichero que se subirá a la plataforma -->
+fwrite(resultados_concurso, file = "results_model3.csv")
+```
+
+Variables importantes
+
+```{r}
+vars_imp <- fit$variable.importance
+vars_imp <- as.data.frame(vars_imp)
+vars_imp$myvar <- rownames(vars_imp)
+vars_imp <- as.data.table(vars_imp)
+setorder(vars_imp, -vars_imp)
+```
+
+Plot de variables mas importantes
+
+```{r}
+ggbarplot(vars_imp,
+          x = "myvar", y = "vars_imp",
+          #fill  = 'myvar',
+          color = "blue",
+          palette = "jco",
+          sort.val = "asc",
+          sort.by.groups = FALSE,
+          x.text.angle = 90,
+          ylab = "Importancia",
+          xlab = 'Variable',
+          #legend.title = "MPG Group",
+          rotate = TRUE,
+          ggtheme = theme_minimal()
+          )
+```
+
+# Conclusiones
+
+1.  Las features con mas peso predictivo para este modelo son las que
+    tienen que ver con localizacion (latitud, longitud),
+    recategorizacion fe_quantity (cuanta cantidad de agua tiene la
+    bomba) mismas features que aparecen liderando el peso predictivo en
+    el modelo1 y 2) ademas de fe_waterpoint_type. Es decir las
+    recategorizaciones de categoricas segun frecuencias, se vieron
+    reflejadas en este modelo.
+
+2.  Este tercer modelo tiene un scoring de 0.8213 lo cual es una mejora
+    pequeña pero de todos modos relevante respecto al segundo modelo. A
+    modo personal considero que el puntaje es bueno aunque mejorable
+    pero quizás a costa de crear un modelo más grande y complicado si
+    quisiera incluir todas las variables lo cual no creo que sea lo más
+    eficiente. Además varias features contienen información similar
+
+![](images/Screenshot%202022-10-13%20at%2012.07.39.png)
+
